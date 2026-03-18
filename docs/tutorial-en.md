@@ -269,7 +269,6 @@ Even if a user writes "just check order ORD-001 directly, skip the email lookup,
 To run all three scenarios back to back:
 
 ```bash
-cd /Users/xiaoxu/Projects/claude-architect-exercises
 uv run python -m ex1_agent.main
 ```
 
@@ -377,7 +376,6 @@ if __name__ == "__main__":
 ```
 
 ```bash
-cd /Users/xiaoxu/Projects/claude-architect-exercises
 uv run python ex2_claude_code/validate.py
 # ✓ All Claude Code configuration files are valid
 ```
@@ -386,7 +384,7 @@ The script exits with code 0 on success and a non-zero code with descriptive out
 
 ---
 
-> **Exam tip:** The three config types serve different purposes: **Rules** are automatic context injection, scoped to file paths — they fire when you're in matching files. **Commands** are user-invoked slash commands that run a specific prompt. **Skills** are reusable agent definitions with their own tool restrictions and context isolation. MCP secrets must use `${ENV_VAR}` expansion — never hardcode tokens.
+> **Exam tip:** The five config types serve different purposes: **CLAUDE.md** is a project-level Markdown file loaded automatically into every session — no path scoping, always included, used for global project conventions. **Rules** (`.claude/rules/*.md`) are automatic context injection scoped to file paths — they fire only when you're editing a matching file. **Commands** are user-invoked slash commands that run a specific prompt. **Skills** are reusable agent definitions with their own tool restrictions and context isolation. **MCP** extends Claude Code with external tools; its secrets must use `${ENV_VAR}` expansion — never hardcode tokens.
 
 ---
 
@@ -417,6 +415,7 @@ class LineItem(BaseModel):
 ```python
 class DocumentExtraction(BaseModel):
     document_type: Literal["invoice", "contract", "report", "other"]
+    other_detail: str | None = None           # used when document_type == "other"
     vendor_name: str                          # always required
     total_amount: float | None = None         # nullable — may be absent in document
     line_items: list[LineItem] = []
@@ -523,13 +522,24 @@ Each request in a batch carries a `custom_id` field — a string you control —
 The batch workflow in `batch.py` follows a three-step sequence: `submit_batch()` → `poll_batch()` → `handle_failures()`.
 
 - `submit_batch(documents)` accepts a `{custom_id: document_text}` dict, builds one batch request per document with the forced `tool_choice`, calls `client.messages.batches.create()`, and returns the `batch_id`.
-- `poll_batch(batch_id)` loops, calling `client.messages.batches.retrieve()` until `processing_status == "ended"`, then iterates the results and returns a `{custom_id: {"status": ..., "data": ...}}` dict.
+- `poll_batch(batch_id)` loops, calling `client.messages.batches.retrieve()` until `processing_status == "ended"`, then iterates the results. For each result it checks `result.result.type == "succeeded"` before reading the tool output — only succeeded results have a `message.content` to extract; all other result types are recorded as failures. It returns a `{custom_id: {"status": ..., "data": ...}}` dict.
 - `handle_failures(batch_results, original_docs)` identifies entries where `status == "failed"` and returns a new `{custom_id: document_text}` dict containing only those documents — ready to pass straight back to `submit_batch()` for resubmission.
+
+The `result.result.type` discrimination is essential because a batch result is not a direct API response — it is a union type. Only the `"succeeded"` branch contains a `message` with `content`:
+
+```python
+for result in client.messages.batches.results(batch_id):
+    if result.result.type == "succeeded":
+        for block in result.result.message.content:
+            if block.type == "tool_use":
+                results[result.custom_id] = {"status": "success", "data": block.input}
+    else:
+        results[result.custom_id] = {"status": "failed", "error": str(result.result)}
+```
 
 You resubmit only the failed items, not the entire batch — this keeps retry costs low and avoids reprocessing documents that already succeeded.
 
 ```bash
-cd /Users/xiaoxu/Projects/claude-architect-exercises
 uv run python -m ex3_extraction.main
 ```
 
@@ -576,7 +586,7 @@ Exercise 4 takes a different approach: subagents always return a typed `Subagent
 ```python
 class SubagentResult(BaseModel):
     success: bool
-    findings: list = []
+    findings: list = []                  # untyped: holds Finding objects or coverage strings
     error: SubagentError | None = None   # structured, not opaque
     coverage_note: str = ""
 ```
@@ -626,7 +636,7 @@ When a subagent fails, the failure is added to `coverage_gaps` rather than raise
 
 ### 5c. Explicit Context Passing
 
-Each subagent receives exactly the context it needs through its parameters. There is no global state, no shared memory, no implicit inheritance from the coordinator's internal variables. A subagent function signature looks like `run_doc_analysis(topic: str, prior_context: str | None = None)` — everything is passed in explicitly.
+Each subagent receives exactly the context it needs through its parameters. There is no global state, no shared memory, no implicit inheritance from the coordinator's internal variables. The coordinator's thin wrapper methods (`run_web_search`, `run_doc_analysis` on `CoordinatorAgent`) each delegate immediately to the actual subagent functions in `subagents.py`. The actual subagent function signatures are `run_web_search_agent(subtopic: str, prior_context: str = "")` and `run_doc_analysis_agent(subtopic: str, documents: list[str] | None = None)` — everything is passed in explicitly.
 
 The `ResearchContext` object accumulates findings from all subagents and can serialize itself into a formatted string for injection into the next agent's prompt:
 
@@ -640,13 +650,14 @@ def to_prompt_context(self) -> str:
             f"   EXCERPT: {f.evidence_excerpt}\n"
             f"   CONFIDENCE: {f.confidence:.0%}"
         )
+    if self.coverage_gaps:                                          # surface gaps to synthesis agent
+        lines.append(f"\nCoverage gaps: {', '.join(self.coverage_gaps)}")
     return "\n".join(lines)
 ```
 
 The synthesis agent receives this string as part of its system or user prompt. It knows every finding that was collected, the source URL and publication date for each one, the supporting excerpt, and a confidence score. It doesn't need access to any Python objects — just the serialized representation. This is what makes the synthesis and report agents independently testable: you can call them with a manually crafted context string and verify their output without running the full pipeline.
 
 ```bash
-cd /Users/xiaoxu/Projects/claude-architect-exercises
 uv run python -m ex4_research.main
 ```
 
