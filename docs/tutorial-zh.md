@@ -269,7 +269,7 @@ Claude 選擇要呼叫哪個工具，靠的是讀取 `TOOL_DEFINITIONS` 裡的 `
 #### 四個工具形成一條呼叫鏈
 
 ```python
-# tools.py — TOOL_DEFINITIONS 結構（節錄前兩個工具）
+# tools.py — TOOL_DEFINITIONS 結構（節錄 get_customer）
 TOOL_DEFINITIONS = [
     {
         "name": "get_customer",
@@ -277,26 +277,16 @@ TOOL_DEFINITIONS = [
             "Look up a customer record by their email address and return their verified customer_id. "
             "ALWAYS call this first before lookup_order or process_refund — customer_id is required "
             "for all subsequent operations. ..."
-        ),
+        ),  # 豐富描述讓模型知道何時該用此工具
         "input_schema": {
             "type": "object",
-            "properties": {"email": {"type": "string", "description": "Customer email address"}},
+            "properties": {
+                "email": {"type": "string", "description": "Customer's email address"}
+            },
             "required": ["email"],
         },
     },
-    {
-        "name": "lookup_order",
-        "description": (
-            "Retrieve order details by order ID. Requires a verified customer_id from get_customer first. "
-            "Do NOT use this to look up customers — use get_customer for that."  # 負面指引同樣重要
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {"order_id": {"type": "string", "description": "Order ID (e.g. ORD-001)"}},
-            "required": ["order_id"],
-        },
-    },
-    # ... process_refund, escalate_to_human
+    # lookup_order、process_refund、escalate_to_human 結構相同，省略
 ]
 ```
 
@@ -432,6 +422,7 @@ class AgentSession:
         if tool_name in _REQUIRES_CUSTOMER and not self.verified_customer_id:
             raise ProgrammaticGateError(  # 擋住呼叫，回報錯誤給模型
                 f"'{tool_name}' requires a verified customer_id from get_customer first."
+                # ...（實際訊息含第二行提示）
             )
 ```
 
