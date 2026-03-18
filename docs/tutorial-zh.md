@@ -105,8 +105,8 @@ claude-architect-exercises/
 
 ```python
 from typing import Any, Literal
-from pydantic import BaseModel
-import json
+from pydantic import BaseModel, field_validator
+import json  # 由 make_tool_result 使用，序列化回傳值
 
 class ToolError(BaseModel):
     errorCategory: Literal["transient", "validation", "permission", "business"]
@@ -178,6 +178,9 @@ def get_client() -> Anthropic:
     return _client             # 第二次呼叫直接回傳已存在的實例
 ```
 
+> **📝 考試重點（client.py）**
+> `get_client()` 是延遲初始化的 singleton：第一次呼叫時建立 `Anthropic` 物件並快取，後續呼叫直接回傳快取值。測試中可用 `unittest.mock.patch` 替換 `_client` 來注入假物件，避免真實 API 呼叫。
+
 幾個值得注意的設計細節：
 
 - `load_dotenv()` 在模組載入時就執行，確保任何 `os.getenv()` 呼叫前環境變數已就緒。
@@ -224,7 +227,7 @@ def print_error(msg: str) -> None:
 
 三個函式的視覺對應：
 
-- `print_message()` — 藍色（assistant）或綠色（user/system）面板，顯示對話訊息
+- `print_message()` — 青色（cyan）（assistant）或綠色（user/system）面板，顯示對話訊息
 - `print_tool_call()` — 黃色面板＋JSON 語法高亮，清楚呈現工具被呼叫時的輸入參數
 - `print_error()` — 紅色粗體前綴，讓錯誤在大量輸出中立即顯眼
 
