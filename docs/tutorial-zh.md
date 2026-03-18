@@ -669,3 +669,303 @@ uv run python ex2_claude_code/validate.py
 > **MCP 機密處理：** 使用 `${ENV_VAR}` 佔位符，Claude Code 啟動時從系統環境變數展開，避免機密寫死進設定檔或版本控制。
 >
 > **規則 vs. 命令：** 規則是被動的——路徑匹配時自動生效，開發者無須主動觸發；命令是主動的——需要使用者輸入 `/指令名` 才執行。Skill 則是命令的進階形式，額外控制代理人的脈絡隔離（`context: fork`）與工具存取權限（`allowed-tools:`）。
+
+---
+
+## 第四章：練習三——結構化資料擷取（ex3_extraction/）
+
+**核心模式：** 強制 tool_use、Pydantic 作為 schema、語意驗證、帶回饋的重試
+
+這一章解決一個實際問題：如何讓 Claude 可靠地將非結構化文件（發票、合約、報告）轉換成固定形狀的 Python 物件，同時偵測資料本身的語意矛盾？
+
+---
+
+### 4a. schema.py — Pydantic 模型與 tool 定義
+
+#### 為何用 tool_use 做結構化擷取，而不是在 prompt 中要求 JSON？
+
+直接在 prompt 要求「請回傳 JSON」有幾個已知問題：
+
+1. **格式不穩定**：Claude 可能在 JSON 前後夾雜說明文字（"Here is the JSON:"），下游 `json.loads()` 會炸掉。
+2. **無法強制 schema**：你無法宣告哪些欄位是必填、哪些型別合法——模型自由發揮。
+3. **缺乏型別保證**：即使回傳了 JSON，`quantity` 可能是字串 `"3"` 而非數字 `3`。
+
+`tool_use` 解決以上三點：你把 schema 以 JSON Schema 形式傳給 API，模型的回傳值保證符合該 schema，Pydantic 再負責最後一哩的型別驗證。
+
+#### LineItem 與 DocumentExtraction 模型
+
+```python
+class LineItem(BaseModel):
+    description: str        # 必填：品項描述
+    quantity: float         # 必填：數量
+    unit_price: float       # 必填：單價
+    total: float            # 必填：小計
+
+class DocumentExtraction(BaseModel):
+    document_type: Literal["invoice", "contract", "report", "other"]
+    other_detail: str | None = None      # 僅當 document_type == "other" 時使用
+
+    vendor_name: str                     # 必填：發行方名稱
+    total_amount: float | None = None    # 可空：文件可能未列出總金額
+    line_items: list[LineItem] = []
+    issue_date: str | None = None        # 可空：日期可能缺失
+
+    stated_total: float | None = None    # 文件上寫的總金額
+    calculated_total: float | None = None  # 明細加總值
+    conflict_detected: bool = False      # 語意自我檢查旗標
+```
+
+#### 可空欄位（`float | None = None`）vs 必填欄位
+
+這是設計決策，不是便利寫法。規則是：
+
+- **必填**（無 `None`）：該資訊在所有目標文件中都一定存在——例如 `vendor_name`。若模型找不到就應該視為擷取失敗，而非留空。
+- **可空**（`| None = None`）：資訊**合理地**可能缺席，且缺席本身是有效狀態——例如 `issue_date`（有些內部文件就是沒有日期）。
+
+把所有欄位都設成可空看似「安全」，但會讓驗證邏輯失去意義，且難以發現真正的擷取失敗。
+
+#### `conflict_detected` 旗標——語意完整性自我檢查
+
+這個布林欄位展示了一個重要模式：**讓模型在擷取時順帶做語意推理**，而不是等到事後驗證才發現問題。
+
+在 tool description 中明確告訴模型：
+
+> "Set `conflict_detected=true` if `stated_total` does not match the sum of `line_items`."
+
+這樣模型在填寫欄位時就會計算並比對，而不是機械複製數字。`validator.py` 再做一次程式層面的確認，形成雙重保險。
+
+#### `get_extraction_tool()` — Pydantic 如何映射到 JSON Schema
+
+`get_extraction_tool()` 手動維護一份與 Pydantic 模型對應的 JSON Schema dict。兩個關鍵點：
+
+- 可空欄位映射為 `"type": ["number", "null"]`，與 Pydantic 的 `float | None` 語意一致。
+- `required` 陣列只包含 `["document_type", "vendor_name", "conflict_detected"]`——其餘欄位不強制。
+
+這個手動維護的 schema 讓你對 API 合約有完整控制，不依賴 `.model_json_schema()` 的自動產出（後者的格式有時需要額外轉換）。
+
+---
+
+### 4b. extractor.py — 強制 tool_use
+
+#### 核心擷取邏輯
+
+```python
+def extract_document(document_text: str) -> dict:
+    client = get_client()
+    response = client.messages.create(
+        model=MODEL,
+        max_tokens=2048,
+        tools=[get_extraction_tool()],
+        tool_choice={"type": "tool", "name": "extract_document"},  # 強制指定
+        messages=[{"role": "user", "content": f"Extract data from this document:\n\n{document_text}"}],
+    )
+    # 從回應中找 tool_use block
+    for block in response.content:
+        if block.type == "tool_use" and block.name == "extract_document":
+            return block.input
+    raise RuntimeError("No tool_use block in response — unexpected API behavior")
+```
+
+#### `tool_choice={"type": "tool", "name": "extract_document"}` — 強制選擇
+
+`tool_choice` 有三種模式（考試常考）：
+
+| 模式 | 行為 |
+|------|------|
+| `{"type": "auto"}` | 模型自行判斷是否呼叫 tool（預設） |
+| `{"type": "any"}` | 模型必須呼叫至少一個 tool，但自選哪個 |
+| `{"type": "tool", "name": "..."}` | 模型必須呼叫指定名稱的 tool |
+
+這裡使用第三種——**強制選擇**。這保證回應一定包含 `extract_document` 的 `tool_use` block，讓下游解析完全可預期，不需要處理「模型選擇直接回答文字」的情況。
+
+#### RuntimeError 防護
+
+即使設定了強制 `tool_choice`，防禦性程式設計仍然重要：
+
+```python
+raise RuntimeError("No tool_use block in response — unexpected API behavior")
+```
+
+這行程式碼永遠不應該被觸發，但若 API 行為異常（例如模型版本切換、quota 限流導致部分回應），它能給出明確的失敗訊息，而不是在後續步驟發生神秘的 `AttributeError`。
+
+---
+
+### 4c. validator.py — 語意驗證與帶回饋的重試
+
+#### `SemanticValidationError`：為何用自訂例外
+
+```python
+class SemanticValidationError(Exception):
+    """Raised when extracted data has semantic inconsistencies."""
+```
+
+使用自訂例外而非內建的 `ValueError`，原因有二：
+
+1. **可被精確捕捉**：呼叫端可以 `except SemanticValidationError as e` 只處理語意問題，其他例外繼續往上傳播。
+2. **訊息即回饋**：例外訊息被設計成可以直接塞進下一個 prompt——這是 `retry_with_feedback()` 的關鍵依賴。
+
+#### `validate_extraction()` — 0.01 容差的浮點數比較
+
+```python
+if (
+    doc.stated_total is not None
+    and doc.calculated_total is not None
+    and not doc.conflict_detected
+    and abs(doc.stated_total - doc.calculated_total) > 0.01
+):
+    raise SemanticValidationError(...)
+```
+
+幾個設計細節值得注意：
+
+- **先確認非 None**：可空欄位在比較前必須做 None 守衛，否則 `abs(None - 3.0)` 在執行期炸掉。
+- **0.01 容差**：浮點數運算不精確（`0.1 + 0.2 ≠ 0.3`），容差避免誤報假警報。
+- **跳過已標記衝突**：若模型自己已設 `conflict_detected=True`，代表它已知悉差異，不需再次報錯。
+
+#### `retry_with_feedback()` — 將錯誤注入下一個 prompt
+
+```python
+def retry_with_feedback(
+    document_text: str,
+    failed_extraction: dict,
+    validation_error: str,
+    max_retries: int = 3,
+) -> dict | None:
+    client = get_client()
+    for attempt in range(max_retries):
+        response = client.messages.create(
+            model=MODEL,
+            max_tokens=2048,
+            tools=[get_extraction_tool()],
+            tool_choice={"type": "tool", "name": "extract_document"},
+            messages=[{
+                "role": "user",
+                "content": (
+                    f"The previous extraction had a validation error. Please fix it.\n\n"
+                    f"ORIGINAL DOCUMENT:\n{document_text}\n\n"
+                    f"FAILED EXTRACTION:\n{json.dumps(failed_extraction, indent=2)}\n\n"
+                    f"VALIDATION ERROR:\n{validation_error}\n\n"  # 具體錯誤注入
+                    f"Please re-extract with the error corrected."
+                )
+            }],
+        )
+        for block in response.content:
+            if block.type == "tool_use":
+                return block.input
+    return None  # 重試耗盡，回傳 None 讓呼叫端決定後續
+```
+
+#### 為何帶回饋的重試比泛用「請修正」更有效
+
+比較兩種重試策略：
+
+- **泛用重試**：`"Please try again."` — 模型不知道哪裡錯了，大概率重複相同錯誤。
+- **帶回饋重試**：把失敗的擷取結果 + 具體錯誤訊息一起傳入 — 模型有完整脈絡，知道要調整 `stated_total` 與 `calculated_total` 的差異。
+
+這是 LLM 應用中的通用原則：**錯誤訊息本身是最好的 prompt 工程素材**。`SemanticValidationError` 的訊息設計成人類可讀且機器可用，正是為了服務這個重試迴圈。
+
+---
+
+### 4d. batch.py — 批次 API
+
+#### 何時使用批次 API
+
+批次 API 適合以下特性同時成立的工作負載：
+
+| 條件 | 說明 |
+|------|------|
+| **大量文件** | 幾十到幾千份，逐一同步處理效率太低 |
+| **可接受延遲** | 不需要即時結果，最長 24 小時都 OK |
+| **成本敏感** | 批次 API 比同步 API **便宜 50%** |
+
+**何時不該用批次：** 任何需要立即回應的流程——例如 pre-merge CI 檢查、使用者互動介面、或下一步驟依賴本步驟結果的管線。
+
+#### `custom_id` 關聯模式
+
+批次 API 不保證回應順序，因此每個請求必須附上 `custom_id`：
+
+```python
+def build_batch_request(custom_id: str, document_text: str) -> dict:
+    return {
+        "custom_id": custom_id,   # 自訂識別碼，用於結果對應
+        "params": { ... }
+    }
+```
+
+慣例是用原始檔案名稱或資料庫 ID 作為 `custom_id`，這樣在批次完成後能直接對應回原始資料。
+
+#### `submit_batch()` → `poll_batch()` → `handle_failures()` 流程
+
+```python
+# 1. 提交
+batch_id = submit_batch({"doc-001": text1, "doc-002": text2})
+
+# 2. 輪詢直到完成
+results = poll_batch(batch_id)
+
+# 3. 處理失敗項目
+retry_docs = handle_failures(results, original_docs)
+if retry_docs:
+    retry_batch_id = submit_batch(retry_docs)  # 只重送失敗的
+```
+
+#### `poll_batch()` 的判斷邏輯
+
+```python
+def poll_batch(batch_id: str, poll_interval: int = 60) -> dict:
+    client = get_client()
+    while True:
+        batch = client.messages.batches.retrieve(batch_id)
+        if batch.processing_status == "ended":   # 唯一結束狀態
+            break
+        time.sleep(poll_interval)                # 預設 60 秒輪詢一次
+
+    results = {}
+    for result in client.messages.batches.results(batch_id):
+        if result.result.type == "succeeded":    # 成功才取 tool_use block
+            for block in result.result.message.content:
+                if block.type == "tool_use":
+                    results[result.custom_id] = {"status": "success", "data": block.input}
+        else:
+            results[result.custom_id] = {
+                "status": "failed",
+                "error": str(result.result),     # 保留原始錯誤供 handle_failures 使用
+            }
+    return results
+```
+
+`result.result.type == "succeeded"` 是關鍵判斷點——批次中每個請求都有自己的成功/失敗狀態，整批「ended」只代表處理完成，不保證全部成功。
+
+`handle_failures()` 的設計讓失敗處理與成功處理完全解耦：它只回傳需要重試的 `{custom_id: text}` dict，呼叫端可選擇立即重送或記錄後人工審查。
+
+---
+
+### 執行練習三
+
+```bash
+uv run python -m ex3_extraction.main
+```
+
+你會看到同步擷取、語意驗證、重試回饋，以及批次提交的完整流程輸出。
+
+---
+
+### 考試重點提示
+
+> **`tool_choice` 的三個選項：**
+>
+> | 設定 | 效果 |
+> |------|------|
+> | `{"type": "auto"}` | 模型自由決定是否使用 tool（預設行為） |
+> | `{"type": "any"}` | 強制呼叫 tool，但模型自選哪個 |
+> | `{"type": "tool", "name": "xxx"}` | 強制呼叫指定名稱的 tool，保證結構化輸出 |
+>
+> **批次 API 的取捨：**
+>
+> - 優勢：50% 成本節省、適合大量文件的離線處理
+> - 限制：最長 24 小時處理視窗、無延遲 SLA 保證、不適合阻塞式或即時工作流
+> - 失敗處理原則：批次「ended」≠ 全部成功，必須逐一檢查 `result.result.type`，對失敗項目用 `custom_id` 追蹤並選擇性重送
+>
+> **重試回饋 prompt 的模式：**
+>
+> 有效的重試 prompt 必須包含三要素：(1) 原始輸入文件、(2) 失敗的擷取結果、(3) 具體的錯誤訊息。缺少任何一項都會讓模型在沒有足夠脈絡的情況下重複相同錯誤。`SemanticValidationError` 的訊息文字應設計為「人類可讀且可直接注入 prompt」的格式。
