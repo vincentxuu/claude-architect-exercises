@@ -30,12 +30,19 @@ def test_make_tool_result_error():
     assert result["is_error"] is True
 
 
+def test_make_tool_result_string_content():
+    result = make_tool_result("tool_789", "already a string")
+    assert result["content"] == "already a string"
+
+
 def test_get_client_returns_singleton(monkeypatch):
     monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
     # Reset singleton for test isolation
     import shared.client as sc
     sc._client = None
-    c1 = get_client()
-    c2 = get_client()
-    assert c1 is c2
-    sc._client = None  # cleanup
+    try:
+        c1 = get_client()
+        c2 = get_client()
+        assert c1 is c2
+    finally:
+        sc._client = None  # always cleanup
