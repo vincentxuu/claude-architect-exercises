@@ -838,16 +838,12 @@ def retry_with_feedback(
             max_tokens=2048,
             tools=[get_extraction_tool()],
             tool_choice={"type": "tool", "name": "extract_document"},
-            messages=[{
-                "role": "user",
-                "content": (
-                    f"The previous extraction had a validation error. Please fix it.\n\n"
-                    f"ORIGINAL DOCUMENT:\n{document_text}\n\n"
-                    f"FAILED EXTRACTION:\n{json.dumps(failed_extraction, indent=2)}\n\n"
-                    f"VALIDATION ERROR:\n{validation_error}\n\n"  # 具體錯誤注入
-                    f"Please re-extract with the error corrected."
-                )
-            }],
+            messages=[{"role": "user", "content": (
+                f"ORIGINAL DOCUMENT:\n{document_text}\n\n"
+                f"FAILED EXTRACTION:\n{json.dumps(failed_extraction, indent=2)}\n\n"
+                f"VALIDATION ERROR:\n{validation_error}\n\n"  # 具體錯誤注入
+                f"Please re-extract with the error corrected."
+            )}],
         )
         for block in response.content:
             if block.type == "tool_use":
