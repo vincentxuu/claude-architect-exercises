@@ -5,6 +5,7 @@ Descriptions are rich enough to guide reliable tool selection.
 """
 import uuid
 from datetime import datetime, timezone
+from shared.types import ToolError
 
 # --- In-memory fixtures (stand-in for real backend) ---
 _CUSTOMERS = {
@@ -22,8 +23,8 @@ def get_customer(email: str) -> dict:
     """Look up a verified customer by email address."""
     customer = _CUSTOMERS.get(email)
     if not customer:
-        return {"errorCategory": "validation", "isRetryable": False,
-                "message": f"No customer found with email '{email}'"}
+        return ToolError(errorCategory="validation", isRetryable=False,
+                        message=f"No customer found with email '{email}'").model_dump()
     return customer
 
 
@@ -31,8 +32,8 @@ def lookup_order(order_id: str) -> dict:
     """Look up order details by order ID. Returns status, amount, and creation timestamp."""
     order = _ORDERS.get(order_id)
     if not order:
-        return {"errorCategory": "validation", "isRetryable": False,
-                "message": f"Order '{order_id}' not found"}
+        return ToolError(errorCategory="validation", isRetryable=False,
+                        message=f"Order '{order_id}' not found").model_dump()
     return order
 
 
@@ -43,8 +44,11 @@ def process_refund(customer_id: str, order_id: str, amount: float) -> dict:
     amount=0 simulates a transient payment-gateway error for testing.
     """
     if amount == 0.0:
-        return {"errorCategory": "transient", "isRetryable": True,
-                "message": "Payment gateway timeout. Retry is safe."}
+        return ToolError(errorCategory="transient", isRetryable=True,
+                        message="Payment gateway timeout. Retry is safe.").model_dump()
+    if amount > 500.0:
+        return ToolError(errorCategory="business", isRetryable=False,
+                        message=f"Refund amount ${amount:.2f} exceeds $500 threshold. Use escalate_to_human.").model_dump()
     return {
         "status": "approved",
         "refund_id": f"REF-{uuid.uuid4().hex[:8].upper()}",

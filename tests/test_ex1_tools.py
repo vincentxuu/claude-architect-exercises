@@ -42,6 +42,12 @@ def test_process_refund_transient_error():
     assert result["isRetryable"] is True
 
 
+def test_process_refund_exceeds_threshold():
+    result = process_refund("C001", "ORD-003", 600.0)
+    assert result["errorCategory"] == "business"
+    assert result["isRetryable"] is False
+
+
 def test_escalate_to_human():
     result = escalate_to_human("C001", "ORD-001", "Refund exceeds threshold", "REFUND_THRESHOLD")
     assert result["status"] == "escalated"
@@ -50,5 +56,7 @@ def test_escalate_to_human():
 
 def test_tool_definitions_have_descriptions():
     for tool in TOOL_DEFINITIONS:
+        assert "name" in tool, f"Tool missing 'name' key"
         assert len(tool["description"]) > 50, f"{tool['name']} description too short"
         assert "input_schema" in tool
+        assert "required" in tool["input_schema"], f"{tool['name']} missing required fields"
