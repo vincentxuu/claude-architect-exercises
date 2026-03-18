@@ -249,3 +249,239 @@ def print_error(msg: str) -> None:
 ---
 
 接下來的第 2 章將進入第一個練習題 `ex1_agent/`，看這些共用元件如何被組裝成一個有升級機制的多工具代理人。
+
+---
+
+## 第二章：練習一——多工具代理人與升級機制（`ex1_agent/`）
+
+這個練習示範了代理人架構的四個核心模式：**tool_use 循環**、**stop_reason 控制流**、**程式碼閘門（programmatic gates）**、以及**前置/後置鉤子（pre/post hooks）**。情境是一個客戶支援代理人，能夠查詢客戶資料、查單、處理退款，以及在需要時將案件升級給真人客服。
+
+---
+
+### 2a. 工具定義（`tools.py`）
+
+#### 豐富的工具描述是可靠工具選擇的基礎
+
+Claude 選擇要呼叫哪個工具，靠的是讀取 `TOOL_DEFINITIONS` 裡的 `description` 欄位——這不是給工程師看的文件，而是**模型的決策依據**。描述寫得模糊，模型就可能在錯誤的時機呼叫錯誤的工具；描述寫得精確，模型才能按照預期的順序執行工具鏈。
+
+以 `get_customer` 的描述為例，它明確指出「**ALWAYS call this first**」，以及「customer_id is required for all subsequent operations」。這樣的描述等同於把呼叫順序的契約直接嵌進工具本身，而不是依賴系統提示詞的字數運氣。
+
+#### 四個工具形成一條呼叫鏈
+
+```python
+# tools.py — TOOL_DEFINITIONS 結構（節錄前兩個工具）
+TOOL_DEFINITIONS = [
+    {
+        "name": "get_customer",
+        "description": (
+            "Look up a customer record by their email address and return their verified customer_id. "
+            "ALWAYS call this first before lookup_order or process_refund — customer_id is required "
+            "for all subsequent operations. ..."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {"email": {"type": "string", "description": "Customer email address"}},
+            "required": ["email"],
+        },
+    },
+    {
+        "name": "lookup_order",
+        "description": (
+            "Retrieve order details by order ID. Requires a verified customer_id from get_customer first. "
+            "Do NOT use this to look up customers — use get_customer for that."  # 負面指引同樣重要
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {"order_id": {"type": "string", "description": "Order ID (e.g. ORD-001)"}},
+            "required": ["order_id"],
+        },
+    },
+    # ... process_refund, escalate_to_human
+]
+```
+
+四個工具的職責鏈：`get_customer`（驗證身份）→ `lookup_order`（查詢訂單）→ `process_refund`（執行退款，限 ≤$500）→ `escalate_to_human`（升級給真人，用於大額或例外情境）。
+
+#### 結構化錯誤回傳 vs. 拋出例外
+
+工具函式遇到錯誤時，**回傳 `ToolError` dict** 而不是 `raise Exception`：
+
+```python
+def get_customer(email: str) -> dict:
+    customer = _CUSTOMERS.get(email)
+    if not customer:
+        return ToolError(                    # 回傳，不是拋出
+            errorCategory="validation",
+            isRetryable=False,
+            message=f"No customer found with email '{email}'"
+        ).model_dump()                       # 轉成普通 dict 傳給模型
+    return customer
+```
+
+為什麼回傳比拋出好？因為例外會在 Python 執行層被捕捉，**模型永遠看不到發生了什麼事**。回傳結構化錯誤 dict 才能讓模型讀到 `errorCategory` 和 `isRetryable`，進而自主決定是否重試或改變策略——這是代理人能夠「自我修正」的基礎。
+
+---
+
+### 2b. 鉤子（`hooks.py`）
+
+#### 為何鉤子能提供提示詞無法保證的確定性
+
+系統提示詞告訴模型「退款超過 $500 請升級給真人」，但這是**建議**，不是**強制**。語言模型有一定的隨機性，在邊緣案例或複雜對話脈絡下，模型偶爾可能忽略這條指令。
+
+鉤子是純 Python 程式碼，只要條件成立，攔截就**一定發生**，不依賴模型的注意力。這就是「確定性保證（deterministic guarantee）」的意義：業務規則在程式碼層執行，而不在提示詞層祈禱。
+
+#### 前置鉤子：HookInterception 例外模式
+
+```python
+# hooks.py — run_pre_tool_hook（完整函式）
+def run_pre_tool_hook(tool_name: str, tool_inputs: dict) -> None:
+    """
+    Enforce business rules before tool execution.
+    Raises HookInterception to redirect the call to a different tool.
+    """
+    if tool_name == "process_refund":
+        amount = tool_inputs.get("amount", 0)
+        if amount > REFUND_THRESHOLD:           # $500 門檻閘門
+            raise HookInterception(             # 拋出例外，而非回傳
+                redirect_to="escalate_to_human",
+                redirect_inputs={
+                    "customer_id": tool_inputs["customer_id"],
+                    "order_id":    tool_inputs["order_id"],
+                    "reason": f"Refund amount ${amount:.2f} exceeds ${REFUND_THRESHOLD:.2f} threshold",
+                    "escalation_type": "REFUND_THRESHOLD",
+                },
+                reason=f"Refund ${amount} > threshold ${REFUND_THRESHOLD}",
+            )
+```
+
+`HookInterception` 是個特殊例外：它不代表「出錯了」，而是「**請改用這個工具、這些參數**」。呼叫端（`agent.py`）捕捉它後，會把 `tool_name` 和 `tool_inputs` 替換成 `e.redirect_to` 和 `e.redirect_inputs`，接著繼續執行。
+
+#### 後置鉤子：資料正規化
+
+`run_post_tool_hook` 在工具執行後、模型看到結果前，做兩件事：
+
+1. **Unix 時間戳 → ISO 8601**：`created_at: 1700000000` 對模型來說是不透明的數字；轉成 `2023-11-14T22:13:20+00:00` 才有語意。
+2. **數字狀態碼 → 字串**：`status: 1` → `"delivered"`，模型才能理解訂單狀態。
+
+---
+
+### 2c. 代理人循環（`agent.py`）
+
+#### `while True` / `stop_reason` 模式
+
+代理人循環的核心邏輯非常簡單：不斷呼叫 API，直到模型說「我做完了」。
+
+```python
+# agent.py — AgentSession.run()（核心循環）
+def run(self, messages: list) -> str:
+    """Run the agentic loop until stop_reason is 'end_turn'. Returns final text."""
+    while True:
+        response = self._call_api(messages)      # 呼叫 Claude API
+
+        if response.stop_reason == "end_turn":   # 模型認為任務完成
+            text = next((b.text for b in response.content if b.type == "text"), "")
+            return text                          # 回傳最終文字回覆，結束循環
+
+        if response.stop_reason == "tool_use":   # 模型想呼叫工具
+            # 把助理的回覆（含工具呼叫請求）加進對話歷史
+            messages.append({"role": "assistant", "content": response.content})
+            # 執行工具，取得結果列表
+            tool_results = self._process_tool_calls(response.content)
+            # 把工具結果以 "user" 角色附加回對話，讓模型繼續推理
+            messages.append({"role": "user", "content": tool_results})
+            continue                             # 回到 while True 頂端
+
+        # stop_reason 為 max_tokens 或其他非預期值
+        raise RuntimeError(f"Unexpected stop_reason: {response.stop_reason!r}")
+```
+
+三個 `stop_reason` 的含義：
+
+| stop_reason | 含義 | 正確處理方式 |
+|-------------|------|-------------|
+| `tool_use` | 模型在回覆中包含一或多個工具呼叫 | 執行工具，將結果附加到歷史，繼續循環 |
+| `end_turn` | 模型完成回覆，不需要再呼叫工具 | 取出文字，結束循環 |
+| `max_tokens` | 回覆被截斷（達到 token 上限） | 視為錯誤，或實作截斷恢復邏輯 |
+
+#### tool_result 訊息結構
+
+工具結果以 `"user"` 角色回傳給模型，格式由 `make_tool_result()` 產生：
+
+```python
+{
+    "type": "tool_result",
+    "tool_use_id": "toolu_01XxxXXX",  # 對應 Claude 發出的工具呼叫 ID
+    "content": "{\"customer_id\": \"C001\", ...}",  # JSON 字串
+}
+```
+
+`tool_use_id` 是關鍵——模型靠它把「我剛才發出的工具請求」和「這個結果」配對，才能繼續正確推理。
+
+#### 程式碼閘門（Programmatic Gates）
+
+`_REQUIRES_CUSTOMER` 集合定義哪些工具必須在 `get_customer` 成功後才能執行：
+
+```python
+_REQUIRES_CUSTOMER = {"lookup_order", "process_refund"}  # 需要先驗證客戶
+
+class AgentSession:
+    def __init__(self):
+        self.verified_customer_id: str | None = None  # 跨輪次追蹤驗證狀態
+
+    def check_gate(self, tool_name: str, tool_inputs: dict) -> None:
+        if tool_name in _REQUIRES_CUSTOMER and not self.verified_customer_id:
+            raise ProgrammaticGateError(  # 擋住呼叫，回報錯誤給模型
+                f"'{tool_name}' requires a verified customer_id from get_customer first."
+            )
+```
+
+`AgentSession` 是一個**有狀態的物件**，`verified_customer_id` 跨越多輪對話持續存在。當 `get_customer` 成功，`_execute_tool` 會把 `customer_id` 存入 session；之後每次 `check_gate` 都會檢查這個值。這樣即使模型「忘記」先驗證客戶，程式碼層也會攔截並給出明確的錯誤訊息，引導模型回到正確路徑。
+
+#### 完整執行流程
+
+一次標準退款請求的完整流程：
+
+1. 使用者送出訊息 → `messages = [{"role": "user", ...}]`
+2. `_call_api()` → `stop_reason = "tool_use"`，模型請求呼叫 `get_customer`
+3. `check_gate()` 通過，`run_pre_tool_hook()` 無攔截，執行 `get_customer()`
+4. `run_post_tool_hook()` 正規化結果，session 儲存 `verified_customer_id`
+5. `tool_result` 附加到 `messages`，進入下一輪
+6. 模型請求 `process_refund` → `check_gate()` 通過（已有 `verified_customer_id`）
+7. `run_pre_tool_hook()` 確認金額 ≤ $500，無攔截，執行退款
+8. 退款結果附加到 `messages`，進入下一輪
+9. `stop_reason = "end_turn"` → 模型給出最終回覆，循環結束
+
+---
+
+### 2d. 執行示範（`main.py`）
+
+```bash
+uv run python -m ex1_agent.main
+```
+
+程式會依序執行三個情境：
+
+**情境一：標準退款（正常流程）**
+使用者 `john@example.com` 請求 ORD-001 的 $49.99 退款。代理人依序呼叫 `get_customer` → `process_refund`，模型收到退款確認後以 `end_turn` 結束，輸出退款成功的回覆。
+
+**情境二：大額退款（鉤子攔截）**
+使用者請求 ORD-003 的 $599 退款。`get_customer` 成功後，模型嘗試呼叫 `process_refund(amount=599)`；`run_pre_tool_hook` 偵測到金額超過 $500，拋出 `HookInterception`，代理人自動改為呼叫 `escalate_to_human`，並帶上 `escalation_type="REFUND_THRESHOLD"`。終端機輸出可見「Hook intercepted → redirecting to escalate_to_human」訊息。
+
+**情境三：閘門阻擋（缺少先決條件）**
+使用者直接詢問「請查詢 ORD-001 的狀態」，沒有提供電子郵件。模型嘗試直接呼叫 `lookup_order`；`check_gate()` 發現 `verified_customer_id` 為 `None`，拋出 `ProgrammaticGateError`，錯誤訊息以 `tool_result` 的形式回傳給模型。模型接收到錯誤後，主動向使用者索取電子郵件地址。
+
+---
+
+> **📝 考試重點**
+>
+> **stop_reason 三個值的具體含義：**
+> - `tool_use`：模型回覆中包含工具呼叫，必須執行完所有工具並附加結果後繼續循環
+> - `end_turn`：模型自然結束回覆，任務完成，取出文字並結束循環
+> - `max_tokens`：輸出被截斷，屬於非預期情況，應作錯誤處理
+>
+> **tool_result 訊息的必填欄位：**
+> `type`（固定為 `"tool_result"`）、`tool_use_id`（對應工具請求的 ID）、`content`（字串格式的結果）。錯誤情況需額外加上 `is_error: true`。
+>
+> **閘門 vs. 鉤子的差別：**
+> - **閘門（gate）**：在執行前檢查「先決條件是否滿足」，不滿足則直接拒絕，把錯誤訊息回傳給模型，引導模型補齊缺少的步驟
+> - **鉤子（hook）**：在執行前/後「修改行為或資料」——前置鉤子可重導向（redirect）呼叫，後置鉤子可轉換（transform）結果；兩者都提供程式碼層的確定性保證，不依賴模型的注意力
