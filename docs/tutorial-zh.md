@@ -476,3 +476,196 @@ uv run python -m ex1_agent.main
 > **閘門 vs. 鉤子的差別：**
 > - **閘門（gate）**：在執行前檢查「先決條件是否滿足」，不滿足則直接拒絕，把錯誤訊息回傳給模型，引導模型補齊缺少的步驟
 > - **鉤子（hook）**：在執行前/後「修改行為或資料」——前置鉤子可重導向（redirect）呼叫，後置鉤子可轉換（transform）結果；兩者都提供程式碼層的確定性保證，不依賴模型的注意力
+
+---
+
+## 第三章：練習二——Claude Code 設定（ex2_claude_code/）
+
+**核心模式：Claude Code 專案設定層次結構**
+
+Claude Code 不只是一個對話介面——它是一套可以透過多層設定檔深度客製化的開發工具。本章帶你逐一認識這五種設定類型，以及它們各自解決什麼問題。
+
+---
+
+### 3a. CLAUDE.md——專案層級指令
+
+`CLAUDE.md` 是最基礎的設定層。每次開啟新的 Claude Code session，它都會自動載入，讓 Claude 理解這個專案的基本規範。
+
+**重點：** 這份檔案不需要路徑範圍（path scoping），規則對整個專案一律套用。
+
+以下是 `ex2_claude_code/CLAUDE.md` 的內容：
+
+```markdown
+# Project Standards
+
+## Code Quality
+- All functions must have type hints           # 所有函式必須有型別標注
+- No bare `except:` — always catch specific exception types
+- Use `pathlib.Path` instead of `os.path` for file operations
+- Prefer f-strings over `.format()` or `%`
+
+## Testing
+- Write tests before implementation (TDD)
+- Every public function needs at least one test
+
+## Git
+- Commits in imperative mood: "Add feature" not "Added feature"
+```
+
+這些規則涵蓋程式碼品質、測試習慣、版本控制三個面向，是任何檔案都必須遵守的全域標準。
+
+---
+
+### 3b. .claude/rules/*.md——路徑範圍規則
+
+規則檔案解決了「不同目錄需要不同規範」的問題。透過 YAML frontmatter 的 `paths:` 欄位，Claude 只在符合的路徑下套用規則，避免把 React 前端規範錯誤套用到後端 API 程式碼上。
+
+**與 CLAUDE.md 的差異：** CLAUDE.md 全域生效；規則只在 `paths:` 命中的檔案時才啟動。
+
+以下是 `react.md` 的 frontmatter：
+
+```yaml
+---
+paths:
+  - "src/components/**/*"   # 套用到所有元件
+  - "src/pages/**/*"        # 套用到所有頁面
+---
+```
+
+本練習共有三個規則檔：
+
+| 檔案 | 適用路徑 | 用途 |
+|------|----------|------|
+| `react.md` | `src/components/**/*`、`src/pages/**/*` | React 元件慣例（函式元件、hooks 命名） |
+| `api.md` | `src/api/**/*`、`src/services/**/*` | API 處理器規範（async、Pydantic 驗證） |
+| `testing.md` | `**/*.test.*`、`**/*.spec.*`、`**/tests/**` | 測試慣例（AAA 模式、命名規則） |
+
+`testing.md` 的路徑模式特別值得注意：它用萬用字元匹配所有測試相關副檔名，無論測試放在哪個目錄都能觸發。
+
+---
+
+### 3c. .claude/commands/*.md——斜線指令
+
+命令（commands）與規則最大的差異在於：**規則是被動觸發的，命令是使用者主動呼叫的。**
+
+在 Claude Code 的對話框輸入 `/review` 或 `/extract-types`，就會執行對應的命令內容。這適合「需要的時候才執行」的任務，而不是每次修改檔案都自動套用的規範。
+
+本練習有兩個命令：
+
+- **`/review`**（`review.md`）：依據團隊檢查清單審查目前檔案，逐項確認型別標注、錯誤處理、測試覆蓋、命名規範與安全性，並回報問題位置與修正建議。
+
+- **`/extract-types`**（`extract-types.md`）：將 Python Pydantic 模型或 dataclass 轉換成 TypeScript interface，處理型別對應（`str` → `string`、`list[T]` → `T[]`）並保留 docstring 為 JSDoc 註解。
+
+命令本身就是一段提示詞，沒有額外 frontmatter。這讓設計命令的門檻很低——只要清楚描述你想要 Claude 做什麼就夠了。
+
+---
+
+### 3d. .claude/skills/*.md——可複用代理人提示詞
+
+Skill 是比命令更進一步的封裝。它透過 frontmatter 控制代理人的執行環境，適合需要獨立脈絡或限定工具集的複雜任務。
+
+本練習有兩個 skill：
+
+以下是 `analyze-codebase.md` 的 frontmatter：
+
+```yaml
+---
+context: fork                        # 啟動隔離的子代理人脈絡
+allowed-tools:                       # 限制代理人只能使用唯讀工具
+  - Read
+  - Grep
+  - Glob
+argument-hint: "path to analyze (default: current directory)"
+---
+```
+
+**`context: fork` 的意義：** 這個欄位告訴 Claude Code 在獨立的子代理人脈絡（isolated sub-agent context）中執行這個 skill，而不是在主對話的脈絡裡執行。子代理人結束後，它的中間步驟不會污染主對話的 context window——這是「agent-as-tool」模式的具體實現。
+
+**`allowed-tools:` 的意義：** 透過明確限制工具集，可以保證分析 skill 不會意外修改任何檔案（只能 Read/Grep/Glob）；而 `generate-tests.md` 則只允許 `Write`，確保它只寫測試、不讀取其他程式碼。
+
+| Skill | `context` | `allowed-tools` | 用途 |
+|-------|-----------|-----------------|------|
+| `analyze-codebase` | `fork` | Read, Grep, Glob | 分析程式碼庫結構，回傳摘要 |
+| `generate-tests` | （未設定）| Write | 為指定函式或類別產生 pytest 測試 |
+
+---
+
+### 3e. .mcp.json——MCP 伺服器設定
+
+MCP（Model Context Protocol）讓 Claude Code 可以連接外部工具伺服器，擴展原生能力之外的功能（如存取 GitHub、資料庫、第三方 API）。
+
+以下是 `ex2_claude_code/.mcp.json` 的完整內容：
+
+```json
+{
+  "mcpServers": {
+    "github": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-github"],
+      "env": {
+        "GITHUB_TOKEN": "${GITHUB_TOKEN}"  // 從環境變數讀取，不寫死
+      }
+    }
+  }
+}
+```
+
+**`${ENV_VAR}` 展開的設計理由：** 機密資訊（如 API token）不應寫死在設定檔裡，因為設定檔通常會進版本控制。`${GITHUB_TOKEN}` 是佔位符，Claude Code 啟動時會自動從系統環境變數展開。這樣即使設定檔外洩，攻擊者也拿不到真實的 token。
+
+---
+
+### 3f. validate.py——設定驗證腳本
+
+`validate.py` 提供了一個命令列工具，讓你在撰寫完設定後立即驗證結構是否完整。
+
+**兩個核心函式：**
+
+- **`validate_structure(base)`**：逐一確認 `REQUIRED_FILES` 列表中的九個設定檔是否存在。只要有任何一個檔案缺失，就回傳含有錯誤訊息的列表。
+
+- **`validate_rule_frontmatter(rule_file)`**：用正規表達式解析規則檔的 YAML frontmatter，確認它以 `---` 開頭、有對應的結尾 `---`，且 frontmatter 中包含 `paths:` 欄位。
+
+以下是 CLI 進入點（`validate.py` 第 47–61 行）：
+
+```python
+if __name__ == "__main__":
+    base = Path(__file__).parent          # 以 validate.py 所在目錄為基準
+    all_errors = validate_structure(base)
+    rules_dir = base / ".claude" / "rules"
+    for rule_file in rules_dir.glob("*.md"):   # 逐一驗證所有規則檔
+        errs = validate_rule_frontmatter(rule_file)
+        all_errors.extend([f"{rule_file.name}: {e}" for e in errs])
+
+    if all_errors:
+        print("VALIDATION FAILED:")
+        for err in all_errors:
+            print(f"  ✗ {err}")
+        sys.exit(1)                        # 非零退出碼，方便 CI 捕捉
+    else:
+        print("✓ All Claude Code configuration files are valid")
+```
+
+執行方式：
+
+```bash
+uv run python ex2_claude_code/validate.py
+```
+
+若所有設定檔齊備且格式正確，會印出 `✓ All Claude Code configuration files are valid`；否則列出所有錯誤並以 `exit(1)` 結束，便於整合進 CI/CD 流程。
+
+---
+
+### 考試重點提示
+
+> **五種設定類型的差異：**
+>
+> | 類型 | 檔案位置 | 觸發方式 | 適用場景 |
+> |------|----------|----------|----------|
+> | CLAUDE.md | 專案根目錄 | 每次 session 自動載入 | 全域程式碼規範 |
+> | rules/*.md | `.claude/rules/` | 路徑符合時自動套用 | 特定目錄/檔案類型的規範 |
+> | commands/*.md | `.claude/commands/` | 使用者輸入 `/指令名` | 按需執行的任務（審查、轉換） |
+> | skills/*.md | `.claude/skills/` | 明確調用 skill | 需要隔離脈絡或限制工具的複雜任務 |
+> | .mcp.json | 專案根目錄 | 啟動時自動載入 | 連接外部工具伺服器 |
+>
+> **MCP 機密處理：** 使用 `${ENV_VAR}` 佔位符，Claude Code 啟動時從系統環境變數展開，避免機密寫死進設定檔或版本控制。
+>
+> **規則 vs. 命令：** 規則是被動的——路徑匹配時自動生效，開發者無須主動觸發；命令是主動的——需要使用者輸入 `/指令名` 才執行。Skill 則是命令的進階形式，額外控制代理人的脈絡隔離（`context: fork`）與工具存取權限（`allowed-tools:`）。
