@@ -603,7 +603,7 @@ MCP（Model Context Protocol）讓 Claude Code 可以連接外部工具伺服器
       "command": "npx",
       "args": ["-y", "@modelcontextprotocol/server-github"],
       "env": {
-        "GITHUB_TOKEN": "${GITHUB_TOKEN}"  // 從環境變數讀取，不寫死
+        "GITHUB_TOKEN": "${GITHUB_TOKEN}"
       }
     }
   }
