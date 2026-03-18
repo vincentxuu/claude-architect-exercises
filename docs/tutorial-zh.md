@@ -965,3 +965,226 @@ uv run python -m ex3_extraction.main
 > **重試回饋 prompt 的模式：**
 >
 > 有效的重試 prompt 必須包含三要素：(1) 原始輸入文件、(2) 失敗的擷取結果、(3) 具體的錯誤訊息。缺少任何一項都會讓模型在沒有足夠脈絡的情況下重複相同錯誤。`SemanticValidationError` 的訊息文字應設計為「人類可讀且可直接注入 prompt」的格式。
+
+---
+
+## 第五章：練習四——多代理人研究流水線（ex4_research/）
+
+練習四示範了生產級多代理人系統的核心架構：**輻輳式協調（hub-and-spoke）**。一個協調器（coordinator）負責統籌全局，多個專責子代理人（subagents）各司其職，透過 `asyncio.gather` 並行執行，並以結構化錯誤傳播取代靜默失敗。這一章的設計原則是：協調器永遠掌握全局，子代理人永遠保持專注。
+
+### 5a. 資料模型（context.py、errors.py）
+
+#### Finding 模型與信心驗證器
+
+`Finding` 是整個流水線的原子資料單位。每個 finding 帶有完整的來源歸因欄位（source attribution fields），讓下游的合成代理人與報告代理人能夠直接引用原始出處：
+
+```python
+class Finding(BaseModel):
+    claim: str
+    evidence_excerpt: str
+    source_url: str
+    publication_date: str | None = None  # ISO 日期；防止時間誤解
+    confidence: float  # 0.0–1.0
+
+    @field_validator("confidence")
+    @classmethod
+    def confidence_must_be_valid(cls, v: float) -> float:
+        if not 0.0 <= v <= 1.0:
+            raise ValueError(f"confidence must be between 0 and 1, got {v}")
+        return v
+```
+
+`field_validator` 在模型實例化時立即觸發，確保從子代理人流入協調器的每一筆資料都是合法的信心分數。這比在後期報告階段才發現髒資料要早得多。
+
+#### ResearchContext：可變的累積器
+
+`ResearchContext` 是協調器在整個研究流程中攜帶的「活文件」。它的設計是一個**可變的累積器**——子代理人回傳結果後，協調器呼叫 `add_findings()` 就地擴充，而不是每次都建立新物件：
+
+`add_findings()` 直接呼叫 `self.findings.extend(new_findings)`，將多個子代理人的發現合併成一份統一清單。
+
+最關鍵的方法是 `to_prompt_context()`，它把整份 `ResearchContext` 序列化為純文字，直接注入下一個子代理人的 prompt：
+
+```python
+def to_prompt_context(self) -> str:
+    """Format findings for injection into a subagent prompt."""
+    if not self.findings:
+        return "No findings yet."
+    lines = [f"Research topic: {self.topic}\n\nFindings:"]
+    for i, f in enumerate(self.findings, 1):
+        lines.append(
+            f"{i}. CLAIM: {f.claim}\n"
+            f"   SOURCE: {f.source_url} (date: {f.publication_date or 'unknown'})\n"
+            f"   EXCERPT: {f.evidence_excerpt}\n"
+            f"   CONFIDENCE: {f.confidence:.0%}"
+        )
+    if self.coverage_gaps:
+        lines.append(f"\nCoverage gaps: {', '.join(self.coverage_gaps)}")  # 明確標記缺口
+    return "\n".join(lines)
+```
+
+注意最後的 `coverage_gaps` 區塊——這不是選填的裝飾，而是設計上的強制要求：合成代理人必須知道哪些主題沒有資料來源，才能在報告中誠實標注限制。
+
+#### SubagentError 與 SubagentResult：取代 try/except 的設計
+
+`errors.py` 定義了錯誤傳播的基礎契約。`SubagentError` 使用 `Literal` 型別限制 `failure_type`，而非自由字串：
+
+```python
+class SubagentError(BaseModel):
+    failure_type: Literal["timeout", "not_found", "parse_error", "rate_limit"]
+    attempted_query: str           # 協調器可用於日誌或重試
+    partial_results: list          # 失敗前找到的任何資料
+    alternatives: list[str]        # 協調器的恢復建議
+```
+
+`Literal` 讓協調器可以用 `match` 語句做精確的失敗類型路由，而不是解析自由文字。`partial_results` 確保即使失敗也不丟失已蒐集的資料。
+
+`SubagentResult` 是整個錯誤處理策略的核心——它是一個 **union type 模式**，讓成功與失敗都能以同樣的型別回傳，完全取代 try/except：
+
+```python
+class SubagentResult(BaseModel):
+    """Union type：成功或失敗，都是同一個型別。"""
+    success: bool
+    findings: list = []            # 無型別——刻意為之（見下方說明）
+    error: SubagentError | None = None
+    coverage_note: str = ""        # 例："music industry data unavailable"
+```
+
+**為何 `findings: list = []` 不標注型別？** 因為 `SubagentResult` 在 `errors.py` 中定義，而 `Finding` 在 `context.py` 中定義。若加上 `list[Finding]`，就會在兩個模組之間形成循環依賴。這是刻意選擇的輕微型別妥協，換取模組的低耦合。協調器呼叫端在取出 findings 之後，再以 `Finding` 型別進行實際操作。
+
+---
+
+### 5b. 子代理人（subagents.py）
+
+#### 沒有隱式脈絡繼承
+
+子代理人的核心設計原則寫在模組文件字串裡：「**Each subagent receives its full context in the prompt (no implicit inheritance)**。」這在分散式或多進程系統中尤其重要——子代理人不應假設自己知道協調器的內部狀態，所有需要的脈絡都必須明確傳入 prompt。
+
+`run_synthesis_agent()` 最能體現這個原則：它接收整個 `ResearchContext` 物件，呼叫 `context.to_prompt_context()` 將其序列化後，整體注入 prompt：
+
+```python
+async def run_synthesis_agent(context: ResearchContext) -> str:
+    prompt = (
+        f"You are a research synthesis agent. Based on these research findings, "
+        f"write a structured summary that:\n"
+        f"1. Groups related findings\n"
+        f"2. Preserves source attribution for each claim\n"
+        f"3. Explicitly notes coverage gaps\n"
+        f"4. Distinguishes well-established findings from contested ones\n\n"
+        f"{context.to_prompt_context()}"  # 整份脈絡明確注入 prompt
+    )
+```
+
+合成代理人不需要「記住」之前做了什麼——它從 prompt 中獲得一切。這讓每個子代理人都是**無狀態且可獨立測試**的。
+
+#### Fixture-based 搜尋：模式驗證優先
+
+`_WEB_SEARCH_FIXTURES` 與 `_DOC_ANALYSIS_FIXTURES` 用字典 key 匹配主題關鍵字，回傳預設的結構化資料。這個設計讓你在不需要真實網路呼叫的情況下，驗證整個協調流程的邏輯是否正確。
+
+當主題關鍵字找不到對應 fixture 時，子代理人主動回傳 `SubagentResult(success=False, error=SubagentError(...))` 而非拋出例外——這就是 union type 模式的實際應用。
+
+`run_report_agent()` 是流水線的最後一個步驟，接收合成文字（純字串），要求模型輸出包含執行摘要、關鍵發現（含引用）與資料覆蓋限制的正式報告格式。
+
+---
+
+### 5c. 協調器（coordinator.py）
+
+#### 輻輳式架構：協調器擁有並行性
+
+`CoordinatorAgent` 是整個系統的神經中樞。Hub-and-spoke 架構的核心原則是：**協調器負責所有跨代理人的協調邏輯，子代理人只負責自己那一塊任務**。子代理人不互相呼叫，不知道彼此的存在。
+
+#### asyncio.gather：兩個子代理人同時啟動
+
+`gather_research()` 是展示並行執行的關鍵方法：
+
+```python
+async def gather_research(self, topic: str) -> ResearchContext:
+    ctx = ResearchContext(topic=topic)
+
+    # 並行啟動——兩個子代理人同時執行，不等彼此完成
+    web_result, doc_result = await asyncio.gather(
+        self.run_web_search(topic),    # 子代理人 1
+        self.run_doc_analysis(topic),  # 子代理人 2
+    )
+
+    # 處理網路搜尋結果
+    if web_result.success:
+        ctx.add_findings(web_result.findings)
+    else:
+        console.print(f"[yellow]Web search failed: {web_result.error.failure_type}[/]")
+        ctx.coverage_gaps.append(f"Web: {web_result.error.attempted_query}")  # 記錄缺口
+
+    # 處理文件分析結果
+    if doc_result.success:
+        ctx.add_findings(doc_result.findings)
+    else:
+        console.print(f"[yellow]Doc analysis failed: {doc_result.error.failure_type}[/]")
+        ctx.coverage_gaps.append(f"Docs: {doc_result.error.attempted_query}")  # 永不吞掉錯誤
+
+    return ctx
+```
+
+若改用循序執行（`await self.run_web_search()` 後才 `await self.run_doc_analysis()`），總耗時是兩個操作時間的總和。`asyncio.gather` 讓兩個操作重疊執行，總耗時接近兩者中較慢的那個——在 I/O 密集的 API 呼叫場景下，效能差距可達數倍。
+
+#### 錯誤處理：coverage_gap 標記，永不吞掉錯誤
+
+當子代理人失敗時，協調器做兩件事：(1) 印出警告讓操作者知情；(2) 將失敗的查詢記入 `ctx.coverage_gaps`。這個 coverage gap 最終會透過 `to_prompt_context()` 出現在合成代理人的 prompt 中，讓最終報告能夠誠實標注「本研究未能涵蓋 X 主題」。
+
+**吞掉錯誤的後果**：如果協調器靜默忽略子代理人失敗，合成代理人會以為資料是完整的，報告會過度自信。Coverage gap 標記模式確保不確定性始終可見。
+
+#### 完整流程：三個階段
+
+`run_research()` 串聯三個階段：
+
+1. **Gather（並行）**：`asyncio.gather` 同時執行網路搜尋與文件分析
+2. **Synthesize（循序）**：必須等 gather 完成後才能合成——有資料依賴
+3. **Report（循序）**：必須等合成完成後才能生成正式報告
+
+第一階段可以並行，後兩階段必須循序，因為它們各自依賴上一階段的輸出。
+
+```bash
+uv run python -m ex4_research.main
+```
+
+---
+
+### 考試重點提示
+
+> **asyncio.gather vs 循序執行：**
+>
+> 循序執行：`total_time = time_A + time_B`
+> 並行執行：`total_time ≈ max(time_A, time_B)`
+>
+> 在 API 呼叫（I/O 密集）場景下，gather 的效能優勢可達數倍。但要注意：gather 中任一任務拋出未捕捉的例外，會導致整個 gather 失敗。`SubagentResult` union type 模式正是為了防止這種情況——子代理人永遠回傳結果物件，而不是拋出例外。
+>
+> **Coverage gap 標記模式——為何永不吞掉子代理人錯誤：**
+>
+> 靜默吞掉子代理人錯誤會導致最終報告在沒有完整資料的情況下過度自信。正確做法是：失敗 → 記入 `coverage_gaps` → 傳入下游合成 prompt → 在最終報告中誠實標注覆蓋限制。這個模式讓系統在降級狀態下仍能提供有用輸出，同時對使用者保持透明。
+>
+> **協調器架構原則：**
+>
+> 協調器負責並行策略、錯誤彙整與階段串聯；子代理人只負責單一任務並回傳結構化結果。兩者的邊界越清晰，系統越容易測試與替換個別子代理人。
+
+---
+
+## 第六章：模式速查表
+
+以下表格彙整本教學涵蓋的所有關鍵 API 模式，供複習或實作時快速查閱。
+
+| 模式 | 檔案 | 說明 |
+|------|------|------|
+| tool_use 循環 | ex1_agent/agent.py | stop_reason == end_turn 前持續重複 |
+| 程式碼閘門 | ex1_agent/agent.py | 先決條件未滿足時阻擋工具呼叫 |
+| 前置鉤子 | ex1_agent/hooks.py | 執行前攔截並重導 |
+| 後置鉤子 | ex1_agent/hooks.py | 結果傳回模型前正規化 |
+| 結構化工具錯誤 | ex1_agent/tools.py | 回傳 ToolError dict 而非拋出例外 |
+| 路徑範圍規則 | ex2_claude_code/.claude/rules/ | Claude Code 脈絡過濾 |
+| 強制 tool_use | ex3_extraction/extractor.py | 保證結構化輸出 |
+| 語意驗證 | ex3_extraction/validator.py | 擷取後捕捉模型推理錯誤 |
+| 帶回饋的重試 | ex3_extraction/validator.py | 將錯誤注入下一個 prompt |
+| 批次 API | ex3_extraction/batch.py | 非同步大量處理，50% 成本 |
+| asyncio.gather | ex4_research/coordinator.py | 並行子代理人執行 |
+| 結構化錯誤傳播 | ex4_research/errors.py | SubagentResult union type |
+| 顯式脈絡傳遞 | ex4_research/subagents.py | 沒有隱式狀態繼承 |
+| 輻輳式架構 | ex4_research/coordinator.py | 中央協調器，子代理人保持專注 |
+
+建議完成四個練習題後，再對照英文版 [docs/tutorial-en.md](tutorial-en.md) 驗證理解——英文版對部分模式有不同角度的說明，兩者搭配閱讀效果最佳。
