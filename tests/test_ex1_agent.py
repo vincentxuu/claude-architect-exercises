@@ -69,3 +69,14 @@ def test_loop_executes_tool_then_terminates():
 
     assert result == "Done."
     assert session.verified_customer_id == "C001"
+
+
+def test_loop_raises_on_unexpected_stop_reason():
+    session = AgentSession()
+    bad_response = MagicMock()
+    bad_response.stop_reason = "max_tokens"
+    bad_response.content = []
+
+    with patch.object(session, "_call_api", return_value=bad_response):
+        with pytest.raises(RuntimeError, match="max_tokens"):
+            session.run([{"role": "user", "content": "Hello"}])

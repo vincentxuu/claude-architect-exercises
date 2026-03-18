@@ -7,7 +7,6 @@ Key patterns demonstrated:
   3. Hooks intercept calls before/after tool execution
   4. Tool results are appended to conversation history each iteration
 """
-import json
 from shared.client import get_client, MODEL
 from shared.types import make_tool_result
 from shared.utils import print_tool_call, print_message
@@ -114,3 +113,7 @@ class AgentSession:
                 # Execute tools and append results
                 tool_results = self._process_tool_calls(response.content)
                 messages.append({"role": "user", "content": tool_results})
+                continue
+
+            # Any other stop_reason (max_tokens, stop_sequence, etc.) is unexpected
+            raise RuntimeError(f"Unexpected stop_reason: {response.stop_reason!r}")
