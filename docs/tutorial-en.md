@@ -286,3 +286,331 @@ Together the three scenarios demonstrate that the enforcement layers are indepen
 ---
 
 > **Exam tip:** Know your `stop_reason` values: `tool_use` (model wants to call tools — keep looping), `end_turn` (model is done — return the text), `max_tokens` (hit token limit — handle it, don't silently drop), `stop_sequence` (hit a stop sequence). Always handle unexpected `stop_reason` values explicitly with a `RuntimeError` rather than silently falling through — silent failures in agentic loops are hard to debug.
+
+---
+
+## Chapter 3: Exercise 2 — Claude Code Configuration
+
+Exercise 2 is different from every other exercise in this repo: it doesn't call the Claude API at all. Instead, it demonstrates how to configure Claude Code — the CLI tool — so it becomes a project-aware collaborator rather than a blank-slate assistant. Well-crafted configuration tells Claude Code which conventions to follow, which files to treat as special, which custom workflows to offer as commands, and which external integrations to load. The difference between an unconfigured and a properly configured Claude Code session is roughly the difference between a contractor who just walked in off the street and one who has read your architecture docs and knows your codebase layout. This chapter covers all five configuration types and what each one is for.
+
+### Configuration files
+
+**CLAUDE.md** is the foundation. It is a Markdown file placed at the root of the project (or any directory Claude Code operates in) and is loaded into context automatically at the start of every session. Unlike rules, CLAUDE.md applies everywhere — there is no path filtering. Use it for things that are always relevant: the project's tech stack, the preferred test framework, the branching strategy, any conventions that apply across every file. This is where you tell Claude Code the basics: "this is a TypeScript monorepo, we use pnpm workspaces, all tests live in `__tests__/` beside the source file they test."
+
+**Rules** (`.claude/rules/*.md`) are path-scoped context injections. Unlike CLAUDE.md, each rule file carries YAML frontmatter that lists the file paths where it applies. Claude Code only injects a rule into context when you are actively working on a file that matches one of its paths. This keeps context lean: your React component conventions don't need to be in context when you're editing a database migration, and your SQL conventions don't need to be in context when you're writing JSX.
+
+A rule file looks like this:
+
+```markdown
+---
+paths:
+  - "src/components/**/*"
+  - "src/pages/**/*"
+---
+
+# React Component Conventions
+
+- Use functional components only — no class components
+- State management: `useState` for local, `useContext` for shared
+```
+
+The `paths:` field determines when this rule fires. The glob patterns follow the same syntax as `.gitignore`. When Claude Code is editing `src/components/Button.tsx`, this rule is injected. When it is editing `src/server/db.ts`, it is not. Without the `paths:` field, a rule applies globally — useful for universal constraints but wasteful for framework-specific guidance.
+
+**Commands** (`.claude/commands/*.md`) are user-invocable slash commands that appear in Claude Code's command palette. Each Markdown file in `.claude/commands/` becomes a `/command-name` that users can invoke during a session. The `review.md` command, for instance, runs a structured code quality checklist against the current file or selection — checking for missing tests, unclear variable names, undocumented edge cases, and so on. The `extract-types.md` command takes Python Pydantic models and converts them to TypeScript interfaces, which is useful in projects that have a FastAPI backend paired with a TypeScript frontend. Commands are invoked manually and run once; they are not triggered automatically by file paths.
+
+**Skills** (`.claude/skills/*.md`) are reusable agent definitions. Where commands are one-shot prompts, skills can specify an isolated execution context, a restricted toolset, and an argument hint for the user. A skill file's frontmatter looks like this:
+
+```markdown
+---
+context: fork
+allowed-tools:
+  - Read
+  - Grep
+  - Glob
+argument-hint: "path to analyze (default: current directory)"
+---
+
+Analyze the codebase at the given path and return a structured summary...
+```
+
+Three frontmatter keys matter here. `context: fork` runs the skill in an isolated context — it gets a fresh session that doesn't inherit the main conversation history, and its findings don't pollute the main context window either. This is exactly what you want for a "scan and summarize" skill that might read hundreds of files: the main session stays clean. `allowed-tools` is a whitelist: the `analyze-codebase` skill can only read files with `Read`, `Grep`, and `Glob` — it cannot write, execute, or call external APIs. This is an important safety boundary for read-only analysis tasks. `argument-hint` is a display string shown as a placeholder when the skill is invoked, prompting the user to supply the right kind of input.
+
+**MCP** (`.mcp.json`) registers Model Context Protocol servers that Claude Code will load for this project. MCP servers extend Claude Code with new tools — database clients, API integrations, custom internal services. The `ex2_claude_code/.mcp.json` file registers the GitHub MCP server:
+
+```json
+{
+  "mcpServers": {
+    "github": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-github"],
+      "env": {
+        "GITHUB_TOKEN": "${GITHUB_TOKEN}"
+      }
+    }
+  }
+}
+```
+
+The critical detail is `${GITHUB_TOKEN}`. This is runtime environment variable expansion — when Claude Code starts, it reads `GITHUB_TOKEN` from the shell environment and substitutes it. The actual token value is never stored in `.mcp.json`. This matters because `.mcp.json` is typically committed to version control: if you hardcode a token here, it will be visible in the repository's git history forever. Always use `${ENV_VAR}` syntax for any credentials or secrets in MCP configuration files.
+
+### validate.py
+
+The `validate.py` script in `ex2_claude_code/` is not an API exercise — it is a configuration linter. It checks that all required configuration files are present in the expected locations and that every rule file in `.claude/rules/` has valid YAML frontmatter containing a `paths:` field. A rule file without `paths:` would apply globally and inject framework-specific context even when working on unrelated files, which degrades Claude Code's performance on those files.
+
+```bash
+cd /Users/xiaoxu/Projects/claude-architect-exercises
+uv run python ex2_claude_code/validate.py
+# ✓ All Claude Code configuration files are valid
+```
+
+The script exits with code 0 on success and a non-zero code with descriptive output on failure, so it can be integrated into a CI pipeline to enforce configuration hygiene as the project evolves.
+
+---
+
+> **Exam tip:** The three config types serve different purposes: **Rules** are automatic context injection, scoped to file paths — they fire when you're in matching files. **Commands** are user-invoked slash commands that run a specific prompt. **Skills** are reusable agent definitions with their own tool restrictions and context isolation. MCP secrets must use `${ENV_VAR}` expansion — never hardcode tokens.
+
+---
+
+## Chapter 4: Exercise 3 — Structured Data Extraction
+
+Exercise 3 tackles a task that comes up constantly in real-world deployments: extracting structured data from unstructured documents — invoices, contracts, reports, purchase orders. The naive approach is to ask the model to "return JSON," but this is surprisingly fragile. Models may wrap the JSON in explanation text, skip fields they're uncertain about, hallucinate values for fields that aren't in the document, or produce slightly different key names than you specified. Exercise 3 shows a more reliable approach: use `tool_use` with a forced `tool_choice`, combine Pydantic schema validation with semantic validation, implement retry-with-feedback rather than retry-blind, and use the Batch API when processing hundreds of documents at once.
+
+### 4a. Why Tool Use for Extraction?
+
+When you ask a model to "return JSON," you are making a request in natural language. The model interprets that request as best it can and may include preamble ("Here is the extracted JSON:"), post-amble ("Let me know if this looks right"), or produce the JSON inside a Markdown code block. You then have to strip all of that, parse the JSON, and handle a hundred different ways the output can be malformed.
+
+When you force a `tool_use` call, you are not asking — you are constraining. The model's response contains a `tool_use` block with an `input` field that is already a parsed Python dict matching your tool's input schema exactly. No text to strip, no JSON to parse, no ambiguity about whether the braces are in the right place. The output is always a structured object. This is the single most important reliability improvement you can make for extraction tasks.
+
+### 4b. Schema Design (`schema.py`)
+
+The tool's input schema is derived from a Pydantic model. The `DocumentExtraction` model defines the complete shape of what the model is asked to produce:
+
+```python
+class DocumentExtraction(BaseModel):
+    document_type: Literal["invoice", "contract", "report", "other"]
+    vendor_name: str                          # always required
+    total_amount: float | None = None         # nullable — may be absent in document
+    line_items: list[LineItem] = []
+    issue_date: str | None = None             # nullable
+    stated_total: float | None = None
+    calculated_total: float | None = None
+    conflict_detected: bool = False           # semantic integrity flag
+```
+
+The nullable fields — `float | None = None` — are intentional and important. Without them, the model is forced to produce a value even when the document doesn't contain one. The result is hallucination: the model invents a plausible-looking date or amount. With `| None = None`, the model can (and should) return `null` for fields that are genuinely absent from the document, and your application can handle that gracefully.
+
+The `conflict_detected` boolean is a semantic integrity flag. The model is instructed to set it to `true` if the `stated_total` on the document doesn't match the sum of `line_items`. This offloads simple arithmetic verification to the model and surfaces the discrepancy explicitly in the structured output rather than leaving it to downstream logic to detect.
+
+The `required` array in `get_extraction_tool()` is equally deliberate:
+
+```python
+"required": ["document_type", "vendor_name", "conflict_detected"],
+# total_amount deliberately omitted — nullable fields must not be required
+```
+
+Only fields that are always present in any valid document are listed as required. If `total_amount` were required, the model would be forced to hallucinate a value for a contract that has no dollar amounts. Required means "always extract this"; nullable means "extract if present, otherwise null."
+
+### 4c. Forced Extraction (`extractor.py`)
+
+The extractor sends a single API call with two key parameters: `tools` (the extraction tool definition) and `tool_choice` (forced selection):
+
+```python
+response = client.messages.create(
+    model=MODEL,
+    max_tokens=2048,
+    tools=[get_extraction_tool()],
+    tool_choice={"type": "tool", "name": "extract_document"},  # forced selection
+    messages=[{"role": "user", "content": f"Extract data from this document:\n\n{document_text}"}],
+)
+for block in response.content:
+    if block.type == "tool_use" and block.name == "extract_document":
+        return block.input  # always a dict matching the schema
+```
+
+`tool_choice={"type": "tool", "name": "extract_document"}` tells the API that the model must call this specific tool — not "maybe call a tool" (`auto`), not "call any tool" (`any`), but this exact tool. The response will always contain a `tool_use` block with `name == "extract_document"`. The result is in `block.input`, which is already a Python dict — no JSON decoding, no parsing, no cleanup.
+
+### 4d. Semantic Validation + Retry (`validator.py`)
+
+Pydantic schema validation runs automatically when the model's `block.input` is used to construct a `DocumentExtraction` instance. If the model returns a string where a float is expected, Pydantic raises a `ValidationError`. This catches type errors reliably.
+
+Semantic validation goes further: it catches cases where the types are correct but the data is logically inconsistent. The most common example is a total mismatch:
+
+```python
+def validate_extraction(doc: DocumentExtraction) -> None:
+    if (
+        doc.stated_total is not None
+        and doc.calculated_total is not None
+        and not doc.conflict_detected
+        and abs(doc.stated_total - doc.calculated_total) > 0.01  # float tolerance
+    ):
+        raise SemanticValidationError(
+            f"stated_total ({doc.stated_total}) does not match "
+            f"calculated_total ({doc.calculated_total}). "
+            f"Set conflict_detected=true if this is intentional."
+        )
+```
+
+The `0.01` tolerance handles floating-point arithmetic drift — $100.00 expressed as `99.999999...` due to floating-point representation should not be treated as a conflict. The function raises `SemanticValidationError` with a precise description of what went wrong.
+
+When validation fails, the retry loop injects that specific error back into the next prompt:
+
+```python
+messages=[{
+    "role": "user",
+    "content": (
+        f"The previous extraction had a validation error. Please fix it.\n\n"
+        f"ORIGINAL DOCUMENT:\n{document_text}\n\n"
+        f"FAILED EXTRACTION:\n{json.dumps(failed_extraction, indent=2)}\n\n"
+        f"VALIDATION ERROR:\n{validation_error}\n\n"  # specific error
+        f"Please re-extract with the error corrected."
+    )
+}]
+```
+
+The pattern of showing the model the original document, the failed output, and the specific error message is far more effective than a generic "try again." The model can see exactly what it produced, compare it to the original document, and understand precisely what constraint it violated. The loop caps retries at 3 to prevent infinite cycling on genuinely ambiguous documents.
+
+### 4e. Batch API (`batch.py`)
+
+The synchronous extraction API is appropriate when a user is waiting for a result. For offline pipelines — nightly ingestion of hundreds of invoices, bulk processing of a document archive — the Batch API is more appropriate. The trade-offs are:
+
+- 50% cost savings compared to synchronous API calls
+- Up to 100,000 requests per batch
+- Processing window of up to 24 hours with no SLA guarantee
+- Not suitable for any workflow where a user is blocking on the response
+
+Each request in a batch carries a `custom_id` field — a string you control — that correlates requests to responses. Because batches are processed asynchronously, the response order is not guaranteed to match submission order. The `custom_id` is how you pair each result with the document that generated it.
+
+When a batch completes, some requests may have failed. `handle_failures()` in `batch.py` iterates the results, identifies failed items by their `error` field, and collects them for resubmission. You resubmit only the failed items, not the entire batch — this keeps retry costs low and avoids reprocessing documents that already succeeded.
+
+```bash
+cd /Users/xiaoxu/Projects/claude-architect-exercises
+uv run python -m ex3_extraction.main
+```
+
+The demo runs against three synthetic documents. The first is a complete invoice with all fields present: vendor name, issue date, line items, and a stated total that matches the sum — `conflict_detected` comes back `false`. The second is a sparse contract with no dollar amounts and no line items: all numeric fields come back as `null`, demonstrating that the model correctly avoids hallucinating values. The third is an invoice where the stated total deliberately doesn't match the sum of line items: `conflict_detected` comes back `true`, and the semantic validator confirms the extraction is internally consistent (it correctly identified the conflict).
+
+---
+
+> **Exam tip:** `tool_choice` has three modes: `{"type": "auto"}` (default — model decides whether to use tools), `{"type": "any"}` (model must use at least one tool), `{"type": "tool", "name": "..."}` (model must use this specific tool). Use the `"tool"` mode when you need guaranteed structured output. The Batch API is ideal for offline pipelines — never use it for user-facing requests that need a response in under 1 minute.
+
+---
+
+## Chapter 5: Exercise 4 — Multi-Agent Research Pipeline
+
+Exercise 4 builds a hub-and-spoke research pipeline. A coordinator agent receives a research topic, dispatches two specialized subagents in parallel — one that searches the web, one that analyzes internal documents — collects both results, hands them to a synthesis agent that merges findings, and finally passes the synthesis to a report agent that writes the final output. The key engineering challenges are not the Claude API calls themselves but everything around them: how to run subagents concurrently without waiting for each one, how to propagate failures without crashing the pipeline, how to pass context between agents without shared mutable state, and how to produce a useful report even when some data sources are unavailable.
+
+### 5a. Context & Error Models
+
+The first design decision is how subagents communicate results back to the coordinator. A naive approach would have each subagent function either return findings or raise an exception. This forces the coordinator to wrap every call in try/except, which makes parallel execution awkward and makes failure modes implicit rather than documented.
+
+Exercise 4 takes a different approach: subagents always return a typed `SubagentResult`, regardless of success or failure:
+
+```python
+class SubagentResult(BaseModel):
+    success: bool
+    findings: list = []
+    error: SubagentError | None = None   # structured, not opaque
+    coverage_note: str = ""
+```
+
+The coordinator always receives a value. It inspects `success` to decide what to do. There is no exception to catch, no hidden failure mode. The `error` field, when present, is not an opaque string — it is a `SubagentError`:
+
+```python
+class SubagentError(BaseModel):
+    failure_type: Literal["timeout", "not_found", "parse_error", "rate_limit"]
+    attempted_query: str
+    partial_results: list       # what was found before failure
+    alternatives: list[str]     # recovery suggestions
+```
+
+`failure_type` as a `Literal` means the coordinator can match on the value programmatically — `if error.failure_type == "rate_limit": schedule_retry()`. `partial_results` carries whatever the subagent managed to find before it failed, so a partial web search isn't a total loss. `alternatives` gives the coordinator concrete options: try a different query, use a fallback source, or simply annotate the gap. This is structured error propagation — failures are first-class citizens in the type system, not exceptional cases to be caught and suppressed.
+
+### 5b. Parallel Execution (`coordinator.py`)
+
+The coordinator's central method is `gather_research()`, which starts both subagents simultaneously using `asyncio.gather`:
+
+```python
+async def gather_research(self, topic: str) -> ResearchContext:
+    ctx = ResearchContext(topic=topic)
+
+    # Both subagents start simultaneously
+    web_result, doc_result = await asyncio.gather(
+        self.run_web_search(topic),
+        self.run_doc_analysis(topic),
+    )
+
+    if web_result.success:
+        ctx.add_findings(web_result.findings)
+    else:
+        ctx.coverage_gaps.append(f"Web: {web_result.error.attempted_query}")
+
+    if doc_result.success:
+        ctx.add_findings(doc_result.findings)
+    else:
+        ctx.coverage_gaps.append(f"Docs: {doc_result.error.attempted_query}")
+
+    return ctx
+```
+
+`asyncio.gather` submits both coroutines to the event loop at the same time. If each subagent takes 3 seconds to complete, `gather` returns after approximately 3 seconds — not 6. This is the correct tool for independent tasks: run them concurrently, wait for all of them, then process results. Compare this to awaiting each coroutine sequentially, which would incur the full sum of all latencies.
+
+When a subagent fails, the failure is added to `coverage_gaps` rather than raised. This is a deliberate architectural choice: a partial result with documented gaps is more useful than a crash. The final report will include a section noting what data sources were unavailable and what queries were attempted — the reader can assess how complete the research is. Suppressing the failure silently, by contrast, would produce a report that appears authoritative but is secretly missing a data source.
+
+### 5c. Explicit Context Passing
+
+Each subagent receives exactly the context it needs through its parameters. There is no global state, no shared memory, no implicit inheritance from the coordinator's internal variables. A subagent function signature looks like `run_doc_analysis(topic: str, prior_context: str | None = None)` — everything is passed in explicitly.
+
+The `ResearchContext` object accumulates findings from all subagents and can serialize itself into a formatted string for injection into the next agent's prompt:
+
+```python
+def to_prompt_context(self) -> str:
+    lines = [f"Research topic: {self.topic}\n\nFindings:"]
+    for i, f in enumerate(self.findings, 1):
+        lines.append(
+            f"{i}. CLAIM: {f.claim}\n"
+            f"   SOURCE: {f.source_url} (date: {f.publication_date or 'unknown'})\n"
+            f"   EXCERPT: {f.evidence_excerpt}\n"
+            f"   CONFIDENCE: {f.confidence:.0%}"
+        )
+    return "\n".join(lines)
+```
+
+The synthesis agent receives this string as part of its system or user prompt. It knows every finding that was collected, the source URL and publication date for each one, the supporting excerpt, and a confidence score. It doesn't need access to any Python objects — just the serialized representation. This is what makes the synthesis and report agents independently testable: you can call them with a manually crafted context string and verify their output without running the full pipeline.
+
+```bash
+cd /Users/xiaoxu/Projects/claude-architect-exercises
+uv run python -m ex4_research.main
+```
+
+The demo runs two scenarios. The first uses a broad AI topic — both the web search and document analysis subagents return findings, the synthesis agent merges them, and the report agent produces a structured report with sources cited. The second uses a narrow quantum computing / pharmaceutical topic where both subagents return `not_found` errors — the final output is a report that contains a coverage gaps section explaining which queries were attempted and came up empty, rather than a crash or a fabricated report.
+
+---
+
+> **Exam tip:** Use `asyncio.gather` when subagents are independent — it runs them concurrently and collects all results before proceeding. Coordinator agents should annotate failures as coverage gaps rather than raising exceptions — a report with documented limitations is more useful than a crash. Never suppress a `SubagentError` silently; always surface it somehow, even if just as a note in the final output.
+
+---
+
+## Chapter 6: Patterns Reference
+
+The following table summarizes every Claude API and Claude Code pattern covered in this tutorial. Use it as a quick reference when preparing for the exam or revisiting a specific technique. Each row links a named pattern to the file that implements it and describes what the pattern achieves.
+
+| Pattern | File | What It Does | Exam Relevance |
+|---------|------|-------------|----------------|
+| tool_use loop | `ex1_agent/agent.py` | `while True` / `stop_reason` control flow | Core agentic pattern |
+| Programmatic gate | `ex1_agent/agent.py` | Block tools until prerequisite met | Safety / ordering |
+| Pre-tool hook | `ex1_agent/hooks.py` | Intercept + redirect before execution | Deterministic enforcement |
+| Post-tool hook | `ex1_agent/hooks.py` | Normalize results before model sees them | Data transformation |
+| Structured tool error | `ex1_agent/tools.py` | Return ToolError dict instead of raising | Graceful agent recovery |
+| Path-scoped rules | `ex2_claude_code/.claude/rules/` | Claude Code context injection | Claude Code config |
+| Forced tool_use | `ex3_extraction/extractor.py` | `tool_choice={"type":"tool"}` | Guaranteed structured output |
+| Semantic validation | `ex3_extraction/validator.py` | Catch model reasoning errors post-extraction | Output quality |
+| Retry with feedback | `ex3_extraction/validator.py` | Inject specific error into next prompt | Iterative correction |
+| Batch API | `ex3_extraction/batch.py` | Async bulk, 50% cost, 24h window | Cost optimization |
+| asyncio.gather | `ex4_research/coordinator.py` | Parallel subagent execution | Performance |
+| Structured error propagation | `ex4_research/errors.py` | `SubagentResult` union type | Fault tolerance |
+| Explicit context passing | `ex4_research/subagents.py` | No implicit state inheritance | Testability |
+| Hub-and-spoke | `ex4_research/coordinator.py` | Central coordinator, focused subagents | Architecture |
+
+---
+
+*Tutorial complete. Run `uv run pytest` to verify all 49 tests pass.*
