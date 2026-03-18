@@ -357,6 +357,25 @@ The critical detail is `${GITHUB_TOKEN}`. This is runtime environment variable e
 
 The `validate.py` script in `ex2_claude_code/` is not an API exercise — it is a configuration linter. It checks that all required configuration files are present in the expected locations and that every rule file in `.claude/rules/` has valid YAML frontmatter containing a `paths:` field. A rule file without `paths:` would apply globally and inject framework-specific context even when working on unrelated files, which degrades Claude Code's performance on those files.
 
+Two functions do the work. `validate_structure(base)` walks the `REQUIRED_FILES` list and records any path that doesn't exist on disk. `validate_rule_frontmatter(rule_file)` reads a single rule file and confirms it opens with a `---` block containing a `paths:` key — if either the opening delimiter or the key is missing, the file is flagged as invalid. The CLI entry point ties them together:
+
+```python
+if __name__ == "__main__":
+    base = Path(__file__).parent
+    all_errors = validate_structure(base)          # check required files exist
+    rules_dir = base / ".claude" / "rules"
+    for rule_file in rules_dir.glob("*.md"):
+        errs = validate_rule_frontmatter(rule_file)
+        all_errors.extend([f"{rule_file.name}: {e}" for e in errs])
+    if all_errors:
+        print("VALIDATION FAILED:")
+        for err in all_errors:
+            print(f"  ✗ {err}")
+        sys.exit(1)                                 # non-zero exit for CI integration
+    else:
+        print("✓ All Claude Code configuration files are valid")
+```
+
 ```bash
 cd /Users/xiaoxu/Projects/claude-architect-exercises
 uv run python ex2_claude_code/validate.py
@@ -383,7 +402,17 @@ When you force a `tool_use` call, you are not asking — you are constraining. T
 
 ### 4b. Schema Design (`schema.py`)
 
-The tool's input schema is derived from a Pydantic model. The `DocumentExtraction` model defines the complete shape of what the model is asked to produce:
+The tool's input schema is derived from a Pydantic model. The schema is split into two classes. `LineItem` represents a single line on an invoice:
+
+```python
+class LineItem(BaseModel):
+    description: str
+    quantity: float
+    unit_price: float
+    total: float          # stored separately so the model can report its own arithmetic
+```
+
+`DocumentExtraction` composes `LineItem` and defines the complete shape of what the model is asked to produce:
 
 ```python
 class DocumentExtraction(BaseModel):
@@ -428,6 +457,17 @@ for block in response.content:
 ```
 
 `tool_choice={"type": "tool", "name": "extract_document"}` tells the API that the model must call this specific tool — not "maybe call a tool" (`auto`), not "call any tool" (`any`), but this exact tool. The response will always contain a `tool_use` block with `name == "extract_document"`. The result is in `block.input`, which is already a Python dict — no JSON decoding, no parsing, no cleanup.
+
+Although the forced `tool_choice` makes a missing `tool_use` block theoretically impossible, `extractor.py` still guards against it explicitly:
+
+```python
+    for block in response.content:
+        if block.type == "tool_use" and block.name == "extract_document":
+            return block.input
+    raise RuntimeError("No tool_use block in response — unexpected API behavior")
+```
+
+The `RuntimeError` at the end of the loop fires only if the API returns a response with no matching block — a signal of an unexpected API behavior change rather than a recoverable extraction failure. Crashing loudly here is correct: silently returning `None` or an empty dict would let bad data flow through validation and corrupt downstream processing.
 
 ### 4d. Semantic Validation + Retry (`validator.py`)
 
@@ -480,7 +520,13 @@ The synchronous extraction API is appropriate when a user is waiting for a resul
 
 Each request in a batch carries a `custom_id` field — a string you control — that correlates requests to responses. Because batches are processed asynchronously, the response order is not guaranteed to match submission order. The `custom_id` is how you pair each result with the document that generated it.
 
-When a batch completes, some requests may have failed. `handle_failures()` in `batch.py` iterates the results, identifies failed items by their `error` field, and collects them for resubmission. You resubmit only the failed items, not the entire batch — this keeps retry costs low and avoids reprocessing documents that already succeeded.
+The batch workflow in `batch.py` follows a three-step sequence: `submit_batch()` → `poll_batch()` → `handle_failures()`.
+
+- `submit_batch(documents)` accepts a `{custom_id: document_text}` dict, builds one batch request per document with the forced `tool_choice`, calls `client.messages.batches.create()`, and returns the `batch_id`.
+- `poll_batch(batch_id)` loops, calling `client.messages.batches.retrieve()` until `processing_status == "ended"`, then iterates the results and returns a `{custom_id: {"status": ..., "data": ...}}` dict.
+- `handle_failures(batch_results, original_docs)` identifies entries where `status == "failed"` and returns a new `{custom_id: document_text}` dict containing only those documents — ready to pass straight back to `submit_batch()` for resubmission.
+
+You resubmit only the failed items, not the entire batch — this keeps retry costs low and avoids reprocessing documents that already succeeded.
 
 ```bash
 cd /Users/xiaoxu/Projects/claude-architect-exercises
@@ -500,6 +546,28 @@ The demo runs against three synthetic documents. The first is a complete invoice
 Exercise 4 builds a hub-and-spoke research pipeline. A coordinator agent receives a research topic, dispatches two specialized subagents in parallel — one that searches the web, one that analyzes internal documents — collects both results, hands them to a synthesis agent that merges findings, and finally passes the synthesis to a report agent that writes the final output. The key engineering challenges are not the Claude API calls themselves but everything around them: how to run subagents concurrently without waiting for each one, how to propagate failures without crashing the pipeline, how to pass context between agents without shared mutable state, and how to produce a useful report even when some data sources are unavailable.
 
 ### 5a. Context & Error Models
+
+Before looking at how subagents communicate failures, it is worth examining what a successful finding looks like. The `Finding` model is the atomic unit of research output:
+
+```python
+class Finding(BaseModel):
+    claim: str
+    evidence_excerpt: str
+    source_url: str                              # mandatory source attribution
+    publication_date: str | None = None          # ISO date; None prevents temporal misinterpretation
+    confidence: float                            # 0.0–1.0
+
+    @field_validator("confidence")
+    @classmethod
+    def confidence_must_be_valid(cls, v: float) -> float:
+        if not 0.0 <= v <= 1.0:
+            raise ValueError(f"confidence must be between 0 and 1, got {v}")
+        return v
+```
+
+Every finding carries mandatory source attribution (`source_url`, `publication_date`) so the synthesis agent can cite sources and readers can verify claims. The `confidence` field has an explicit Pydantic `@field_validator` that rejects any value outside the 0–1 range at construction time, preventing bad data from ever entering `ResearchContext`.
+
+`ResearchContext` acts as a mutable accumulator for the pipeline's findings. Its `add_findings(new_findings)` method appends a list of `Finding` objects to the internal `findings` list. The coordinator calls it once per successful subagent result — first with the web search findings, then with the document analysis findings — building up a single unified list before passing the context to the synthesis agent. This design keeps accumulation logic in one place rather than scattered across the coordinator method.
 
 The first design decision is how subagents communicate results back to the coordinator. A naive approach would have each subagent function either return findings or raise an exception. This forces the coordinator to wrap every call in try/except, which makes parallel execution awkward and makes failure modes implicit rather than documented.
 
